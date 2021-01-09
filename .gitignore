@@ -1,6 +1,7 @@
 Ansys
 Data
 Printing
+Workspace
 *.fpp
 *.stl
 *.gx
