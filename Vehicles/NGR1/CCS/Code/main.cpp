@@ -20,10 +20,12 @@
 #include "Drivers/Timer.h"
 #include "Drivers/PWMDrv.h"
 #include "Drivers/SerialDriver.h"
+#include "Drivers/SBUSComm.h"
+#include "Drivers/BaroDrv.h"
 #include "Drivers/MPU9250Drv.h"
 #include "Drivers/UBloxGPS.h"
 #include "Drivers/EtherDriver.h"
-#include "Drivers/AS5147UEncoder.h"
+#include "Drivers/IMU.h"
 #include "Drivers/swupdate.h"
 
 #include "CommData.h"
@@ -36,20 +38,23 @@ extern bool g_swUpdateRequest;
 DBGLed dbgLed;
 Timer timerLoop;
 PWMDrv pwmDrv;
-SerialDriver serialU2; // internal GPS
+SerialDriver serialU3; // SBUS, RX
+SerialDriver serialU5; // external GPS
+BaroDrv baroDrv;
+SBUSComm sbusRecv;
 MPU9250Drv mpu9250Drv;
 UBloxGPS gps;
 EtherDriver etherDrv;
-AS5147EncoDrv as5147Drv;
+IMU imu;
 
 // System Objects
 LLConverter llConv;
 
 // GPS Port (serialU2->Internal GPS, serialU5->External GPS on Ext Comm.)
-#define serialGPS serialU2
+#define serialGPS serialU5
 
 // Systick
-#define SysTickFrequency 100
+#define SysTickFrequency 1000
 volatile bool SysTickIntHit = false;
 
 // Buffers
@@ -67,35 +72,24 @@ int MainLoopCounter;
 float PerfLoopTimeMS;
 float PerfCpuTimeMS;
 float PerfCpuTimeMSMAX;
+
 float Acc[3];
+float Gyro[3];
+float Mag[3];
 
-uint16_t PositionPanEnco = 0;
-uint16_t PositionTiltEnco = 0;
+// OFFSETS
+#define GYROOFFX -1.004f
+#define GYROOFFY 1.344f
+#define GYROOFFZ -0.6995f
+#define MAGOFFX -10.8451f
+#define MAGOFFY 15.3744f
+#define MAGOFFZ 155.7038f
+#define ATTOFFROLL 1.5f
+#define ATTOFFPITCH 1.9f
 
-float PositionPanDeg = 0;
-float PositionTiltDeg = 0;
-
-// 0 - disabled
-// 1 - manual
-// 2 - ....
-uint32_t CmdMode = 0;
-float RefManualPan = 0; // [-1...1]
-float RefManualTilt = 0; // [-1...1]
-
-float RefAutoPanDeg = 0; // [-180...+180]
-float RefAutoTiltDeg = 0; // [-90...+90]
-
-// Safety
-int32_t ManualCounter = 0; // shutdown system when reaches zero
-
-// Config
-#define PANPWMCENTER 1510
-#define TILTPWMCENTER 1500
-
-#define PANLEVELDEG 257.4913f
-#define TILTLEVELDEG 34.1915f
-
-float GAIN_K = 0.2f; // 0.3+ begins to overshot
+//double g1 = 0;
+//double g2 = 0;
+//double g3 = 0;
 
 void main(void)
 {
@@ -112,20 +106,21 @@ void main(void)
 	dbgLed.Init();
 	timerLoop.Init();
 	pwmDrv.Init();
-
 	// set all PWMs to middle
-	pwmDrv.SetWidthUS(0, PANPWMCENTER );
-	pwmDrv.SetWidthUS(1, TILTPWMCENTER );
+	pwmDrv.SetWidthUS(0, 1500 );
+	pwmDrv.SetWidthUS(1, 1500 );
 	pwmDrv.SetWidthUS(2, 1500 );
 	pwmDrv.SetWidthUS(3, 1500 );
 	pwmDrv.SetWidthUS(4, 1500 );
 	pwmDrv.SetWidthUS(5, 1500 );
-
-	serialU2.Init(UART2_BASE, 9600); // GPS
+	serialU3.Init(UART3_BASE, 100000); // SBUS
+	serialU5.Init(UART5_BASE, 115200); // Ext. Comm, Ext. GPS - F9
+	sbusRecv.Init();
+	baroDrv.Init();
 	mpu9250Drv.Init();
-	InitGPS(); // init GPS
 	etherDrv.Init();
-    as5147Drv.Init();
+	imu.Init();
+	gps.Init();
 
 	// Systick
 	SysTickPeriodSet(g_ui32SysClock/SysTickFrequency);
@@ -149,98 +144,60 @@ void main(void)
 		/////////////////////////////////
 		// INPUTS
 		/////////////////////////////////
-		// Encoders
-		as5147Drv.Update();
-		PositionPanEnco = as5147Drv.GetCounter1();
-		PositionTiltEnco = as5147Drv.GetCounter2();
-		// calculate deg
-		float degPan = PositionPanEnco/16384.0f * 360; // [0...359.987]
-		float degTilt = PositionTiltEnco/16384.0f * 360; // [0...359.987]
-		// center
-		degPan -= PANLEVELDEG;
-		degTilt -= TILTLEVELDEG;
-		// wrap to -180...180
-		if( degPan < -180 ) degPan+=360;
-		if( degPan > 180 ) degPan-=360;
-		if( degTilt < -180 )degTilt+=360;
-		if( degTilt > 180 )degTilt-=360;
-		PositionPanDeg = degPan;
-		PositionTiltDeg = degTilt;
+		// SBUS Data
+		int rd = serialU3.Read(CommBuffer, COMMBUFFERSIZE); // read data from SBUS Recv [2500 bytes/second, read at least 3x per second for 1k buffer!!!]
+		sbusRecv.NewRXPacket(CommBuffer, rd); // process data
 
-
+		// Baro
+		baroDrv.Update(); // [??? us]
 
 		// IMU1
 		mpu9250Drv.Update();
 		Acc[0] = -mpu9250Drv.Accel[1];
 		Acc[1] = -mpu9250Drv.Accel[0];
 		Acc[2] = mpu9250Drv.Accel[2];
+		Gyro[0] = mpu9250Drv.Gyro[1] - GYROOFFX;
+		Gyro[1] = mpu9250Drv.Gyro[0] - GYROOFFY;
+		Gyro[2] = -mpu9250Drv.Gyro[2] - GYROOFFZ;
+		Mag[0] = mpu9250Drv.Mag[0] - MAGOFFX;
+		Mag[1] = mpu9250Drv.Mag[1] - MAGOFFY;
+		Mag[2] = mpu9250Drv.Mag[2] - MAGOFFZ;
+		imu.Update(Acc[0], Acc[1], Acc[2], Gyro[0], Gyro[1], Gyro[2], Mag[0], Mag[1], Mag[2]); // TODO: CHECK AXES
+		// Correct IMU offsets
+		imu.Roll -= ATTOFFROLL;
+		imu.Pitch -= ATTOFFPITCH;
+		//g1 = 0.9999*g1 + 0.0001*Gyro[0];
+		//g2 = 0.9999*g2 + 0.0001*Gyro[1];
+		//g3 = 0.9999*g3 + 0.0001*Gyro[2];
 
 		// GPS
-		int rd = serialGPS.Read(CommBuffer, COMMBUFFERSIZE); // read data from GPS
+		rd = serialGPS.Read(CommBuffer, COMMBUFFERSIZE); // read data from GPS
 		gps.NewRXPacket(CommBuffer, rd); // process data
-		if( gps.NumSV >= 6) // set home position
-		{
-			if( !llConv.IsHomeSet() )
-			{
-				double lat = gps.Latitude * 1e-7;
-				double lon = gps.Longitude * 1e-7;
-				llConv.SetHome(lat, lon);
-			}
-		}
-
+		// GPS TODO!!!
 
 		// Process ethernet (RX)
-		etherDrv.Process(1000/SysTickFrequency); // 10ms tick
+		etherDrv.Process(1000/SysTickFrequency); // 1ms tick
 
 
 		/////////////////////////////////
 		// CTRL STEP
 		/////////////////////////////////
-		float outputPWMPan = PANPWMCENTER;
-		float outputPWMTilt = TILTPWMCENTER;
-		if( CmdMode == 0x01)
-		{
-		    if( ManualCounter > 0) // safety shutdown for manual control
-		    {
-		        ManualCounter--;
-
-		        // limit check
-		        if( (PositionPanDeg < 175  && RefManualPan > 0) || (PositionPanDeg > -175  && RefManualPan < 0) )
-		        {
-		            outputPWMPan = PANPWMCENTER + (RefManualPan*150);
-		        }
-
-		        if( (PositionTiltDeg < 85  && RefManualTilt > 0) || (PositionTiltDeg > -85  && RefManualTilt < 0) )
-		        {
-		            outputPWMTilt = TILTPWMCENTER + (RefManualTilt*150);
-		        }
-		    }
-		    else CmdMode = 0x00;
-  		}
-
-		if( CmdMode == 0x02 )
-		{
-		    // AUTO MODE
-		    float deltaPan = RefAutoPanDeg - PositionPanDeg;
-		    float deltaTilt = RefAutoTiltDeg - PositionTiltDeg;
-
-		    float outputPan = GAIN_K * deltaPan;
-		    if( outputPan > 1) outputPan = 1;
-		    if( outputPan < -1) outputPan = -1;
-
-		    float outputTilt = GAIN_K * deltaTilt;
-            if( outputTilt > 1) outputTilt = 1;
-		    if( outputTilt < -1) outputTilt = -1;
-
-		    outputPWMPan = PANPWMCENTER + (outputPan*150);
-            outputPWMTilt = TILTPWMCENTER + (outputTilt*150);
-		}
-
+		int throttle = sbusRecv.Channels[0];
+		int aileron = sbusRecv.Channels[1];
+		int elevator = sbusRecv.Channels[2];
+		int rudder = sbusRecv.Channels[3];
+		int ASwitch = sbusRecv.Channels[4];
+		int DSwitch = sbusRecv.Channels[5];
+		
 		/////////////////////////////////
 		// OUTPUTS
 		/////////////////////////////////
-		pwmDrv.SetWidthUS(0, outputPWMPan );
-		pwmDrv.SetWidthUS(1, outputPWMTilt );
+		pwmDrv.SetWidthUS(0, throttle + 476);
+		pwmDrv.SetWidthUS(1, aileron + 476);
+		pwmDrv.SetWidthUS(2, elevator + 476);
+		pwmDrv.SetWidthUS(3, rudder + 476);
+		pwmDrv.SetWidthUS(4, ASwitch + 476);
+		pwmDrv.SetWidthUS(5, DSwitch + 476);
 
 		// Ethernet
 		SendPeriodicDataEth();
@@ -263,7 +220,7 @@ void main(void)
 
 void SendPeriodicDataEth()
 {
-    SGimbal3kData data{};
+/*    SGimbal3kData data{};
     data.LoopCounter = MainLoopCounter;
     data.ActiveMode = CmdMode;
 
@@ -288,7 +245,7 @@ void SendPeriodicDataEth()
     data.PositionPanDeg = PositionPanDeg;
     data.PositionTiltDeg = PositionTiltDeg;
 
-    etherDrv.SendPacket(0x20, (char*)&data, sizeof(data));
+    etherDrv.SendPacket(0x20, (char*)&data, sizeof(data));*/
 }
 
 void ProcessCommand(int cmd, unsigned char* data, int dataSize)
@@ -297,62 +254,9 @@ void ProcessCommand(int cmd, unsigned char* data, int dataSize)
     {
         case 0x30: // Command received
         {
-            if( dataSize == sizeof(SGimbal3kCommand))
-            {
-                SGimbal3kCommand cmdRef;
-                memcpy(&cmdRef, data, dataSize);
-
-                if( cmdRef.Command == 0x01)
-                {
-                    CmdMode = 0x01;
-                    RefManualPan = cmdRef.RefPan;
-                    RefManualTilt = cmdRef.RefTilt;
-
-                    ManualCounter = 100; // 1 second for shutdown
-                }
-
-                if( cmdRef.Command == 0x02)
-                {
-                    CmdMode = 0x02;
-                    RefAutoPanDeg = cmdRef.RefPan;
-                    RefAutoTiltDeg = cmdRef.RefTilt;
-
-                    // LIMIT REFs
-                    if( RefAutoPanDeg > 175) RefAutoPanDeg = 175;
-                    if( RefAutoPanDeg < -175) RefAutoPanDeg = -175;
-                    if( RefAutoTiltDeg > 85) RefAutoTiltDeg = 85;
-                    if( RefAutoTiltDeg < -85) RefAutoTiltDeg = -85;
-                }
-            }
             break;
         }
     }
-}
-
-void InitGPS(void)
-{
-	SysCtlDelay(g_ui32SysClock); // Wait Ext. GPS to boot
-
-	gps.Init();
-	// send GPS init commands
-	int toSend = gps.GenerateMsgCFGPrt(CommBuffer, 57600); // set to 57k
-	serialGPS.Write(CommBuffer, toSend);
-	SysCtlDelay(g_ui32SysClock/10); // 100ms wait, flush
-	serialGPS.Init(UART2_BASE, 57600); // open with 57k (115k doesn't work well??? small int FIFO, wrong INT prio?)
-	toSend = gps.GenerateMsgCFGRate(CommBuffer, 100); // 100ms rate, 10Hz
-	serialGPS.Write(CommBuffer, toSend);
-	toSend = gps.GenerateMsgCFGMsg(CommBuffer, 0x01, 0x07, 1); // NAV-PVT
-	serialGPS.Write(CommBuffer, toSend);
-	toSend = gps.GenerateMsgCFGMsg(CommBuffer, 0x01, 0x35, 1); // NAV-SAT
-	serialGPS.Write(CommBuffer, toSend);
-	toSend = gps.GenerateMsgNAV5Msg(CommBuffer, 6, 3); // airborne <1g, 2D/3D mode
-	//toSend = m_GPS.GenerateMsgNAV5Msg(CommBuffer, 7, 2); // airborne <2g, 3D mode only
-	serialGPS.Write(CommBuffer, toSend);
-
-	// check response
-	SysCtlDelay(g_ui32SysClock/10); // 100ms wait, wait response
-	int rd = serialGPS.Read(CommBuffer, COMMBUFFERSIZE);
-	gps.NewRXPacket(CommBuffer, rd);
 }
 
 ///////////////
@@ -360,17 +264,17 @@ void InitGPS(void)
 ///////////////
 extern "C" void UART2IntHandler(void)
 {
-	serialU2.IntHandler();
+	//serialU2.IntHandler();
 }
 
 extern "C" void UART3IntHandler(void)
 {
-	//serialU3.IntHandler();
+	serialU3.IntHandler();
 }
 
 extern "C" void UART5IntHandler(void)
 {
-	//serialU5.IntHandler();
+	serialU5.IntHandler();
 }
 
 extern "C" void IntGPIOA(void)
