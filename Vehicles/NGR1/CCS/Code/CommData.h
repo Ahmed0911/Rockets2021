@@ -41,4 +41,19 @@ struct SGimbal3kCommand
 // data[1] = 0x24; // magic codes
 // data[2] = TYPE; // [0x10 - PING, 0x20 - DATA, 0.30 - Command...]
 // data[3] = data....
+
+
+struct SMatlabData
+{
+    uint32_t LoopCounter;
+    uint32_t IterationNr;
+    float Acc[3];
+    float Gyro[3];
+};
+
+struct SMatlabCommand
+{
+    uint32_t IterationNr;
+};
+
 #endif /* COMMDATA_H_ */

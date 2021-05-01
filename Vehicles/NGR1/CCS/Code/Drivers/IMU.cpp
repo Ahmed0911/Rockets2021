@@ -11,8 +11,8 @@ void IMU::Init(void)
 {
 	m_FirstData = true; // first update is DCM init!
 
-	// Initialize the DCM system. 100 hz sample rate, accel weight = .01, gyro weight = .98, mag weight = .01
-	CompDCMInit(&m_sCompDCMInst, 1.0f / 100.0f, 0.001f, 0.998f, 0.001f); // TODO: MODIFY!!!!
+	// Initialize the DCM system. 1000 hz sample rate, accel weight = .01, gyro weight = .98, mag weight = .01
+	CompDCMInit(&m_sCompDCMInst, 1.0f / 1000.0f, 0.001f, 0.998f, 0.001f); // TODO: MODIFY!!!!
 }
 
 // acc - [g]

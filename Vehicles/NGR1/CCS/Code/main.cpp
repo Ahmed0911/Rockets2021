@@ -77,6 +77,8 @@ float Acc[3];
 float Gyro[3];
 float Mag[3];
 
+int IterationNr = 0;
+
 // OFFSETS
 #define GYROOFFX -1.004f
 #define GYROOFFY 1.344f
@@ -192,12 +194,12 @@ void main(void)
 		/////////////////////////////////
 		// OUTPUTS
 		/////////////////////////////////
-		pwmDrv.SetWidthUS(0, throttle + 476);
+		/*pwmDrv.SetWidthUS(0, throttle + 476);
 		pwmDrv.SetWidthUS(1, aileron + 476);
 		pwmDrv.SetWidthUS(2, elevator + 476);
 		pwmDrv.SetWidthUS(3, rudder + 476);
 		pwmDrv.SetWidthUS(4, ASwitch + 476);
-		pwmDrv.SetWidthUS(5, DSwitch + 476);
+		pwmDrv.SetWidthUS(5, DSwitch + 476);*/
 
 		// Ethernet
 		SendPeriodicDataEth();
@@ -220,32 +222,17 @@ void main(void)
 
 void SendPeriodicDataEth()
 {
-/*    SGimbal3kData data{};
+    SMatlabData data{};
     data.LoopCounter = MainLoopCounter;
-    data.ActiveMode = CmdMode;
+    data.IterationNr = IterationNr;
+    data.Acc[0] = Acc[0];
+    data.Acc[1] = Acc[1];
+    data.Acc[2] = Acc[2];
+    data.Gyro[0] = Gyro[0];
+    data.Gyro[1] = Gyro[1];
+    data.Gyro[2] = Gyro[2];
 
-    // acc
-    data.AccX = Acc[0];
-    data.AccY = Acc[1];
-    data.AccZ = Acc[2];
-
-    // gps
-    if( llConv.IsHomeSet())
-    {
-        double lat;
-        double lon;
-        llConv.GetHome(lat, lon);
-        data.HomeLatitude = lat;
-        data.HomeLongitude = lon;
-    }
-
-    data.PositionPanEncoCNT = PositionPanEnco;
-    data.PositionTiltEncoCNT = PositionTiltEnco;
-
-    data.PositionPanDeg = PositionPanDeg;
-    data.PositionTiltDeg = PositionTiltDeg;
-
-    etherDrv.SendPacket(0x20, (char*)&data, sizeof(data));*/
+    etherDrv.SendPacket(0x20, (char*)&data, sizeof(data));
 }
 
 void ProcessCommand(int cmd, unsigned char* data, int dataSize)
@@ -254,6 +241,10 @@ void ProcessCommand(int cmd, unsigned char* data, int dataSize)
     {
         case 0x30: // Command received
         {
+            SMatlabCommand cmd;
+            memcpy(&cmd, data, sizeof(cmd)); // extract iteration number
+            IterationNr = cmd.IterationNr;
+
             break;
         }
     }
